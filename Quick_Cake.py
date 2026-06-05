@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Quick Cake",
     "author": "Quick Cake",
-    "version": (1, 3, 0),
+    "version": (1, 3, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Quick Cake",
     "description": "Автоматизация запекания текстур с High Poly на Low Poly",
@@ -35,7 +35,7 @@ class QuickCakeProps(PropertyGroup):
     bake_type: EnumProperty(
         name="Bake Type",
         items=[
-            ('BASE_COLOR',         "Base Color",        "Диффузный цвет (Diffuse, Color only)"),
+            ('BASE_COLOR',         "Base Color",        "Диффузный цвет (Color only)"),
             ('NORMAL',             "Normal",            "Карта нормалей (Tangent Space)"),
             ('AMBIENT_OCCLUSION',  "Ambient Occlusion", "Карта AO"),
         ],
@@ -299,29 +299,6 @@ def _exit_local_view(context):
             break
 
 
-def _calculate_ao_distance(obj):
-    """Calculate AO Distance as 3% of object bounding box."""
-    bbox_coords = [obj.matrix_world @ obj.bound_box[i] for i in range(8)]
-    min_x = min(c.x for c in bbox_coords)
-    max_x = max(c.x for c in bbox_coords)
-    min_y = min(c.y for c in bbox_coords)
-    max_y = max(c.y for c in bbox_coords)
-    min_z = min(c.z for c in bbox_coords)
-    max_z = max(c.z for c in bbox_coords)
-    
-    size_x = max_x - min_x
-    size_y = max_y - min_y
-    size_z = max_z - min_z
-    max_size = max(size_x, size_y, size_z)
-    
-    if max_size == 0:
-        return 0.1
-    
-    # 3% от максимального размера
-    ao_distance = max_size * 0.03
-    return max(ao_distance, 0.01)
-
-
 # ─────────────────────────────────────────────
 #  Operators
 # ─────────────────────────────────────────────
@@ -519,13 +496,14 @@ class QUICKCAKE_OT_bake(Operator):
 
         try:
             if btype == 'BASE_COLOR':
-                # Diffuse Color bake
+                # Diffuse Color bake - только цвет без освещения
                 bpy.ops.object.bake(
                     type='DIFFUSE',
                     use_selected_to_active=True,
                     cage_extrusion=extrusion,
                     max_ray_distance=max_ray_distance,
                     margin=16,
+                    pass_filter={'COLOR'},
                 )
 
             elif btype == 'NORMAL':
@@ -540,13 +518,12 @@ class QUICKCAKE_OT_bake(Operator):
                 )
 
             elif btype == 'AMBIENT_OCCLUSION':
-                # AO bake с автоматическим расчетом
-                ao_distance = _calculate_ao_distance(low)
+                # AO bake
                 bpy.ops.object.bake(
                     type='AO',
                     use_selected_to_active=True,
                     cage_extrusion=extrusion,
-                    max_ray_distance=ao_distance,
+                    max_ray_distance=max_ray_distance,
                     margin=16,
                 )
 
@@ -633,6 +610,7 @@ class QUICKCAKE_OT_show_result(Operator):
         mat_name = low.name + "_QC_Preview"
         if mat_name in bpy.data.materials:
             mat = bpy.data.materials[mat_name]
+            # Удаляем все ноды, чтобы не было дублей
             nt = mat.node_tree
             for n in list(nt.nodes):
                 nt.nodes.remove(n)
@@ -642,6 +620,7 @@ class QUICKCAKE_OT_show_result(Operator):
         mat.use_nodes = True
         nt = mat.node_tree
 
+        # Создаем чистый граф нодов
         out = nt.nodes.new('ShaderNodeOutputMaterial')
         pbsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
         out.location = (300, 0)

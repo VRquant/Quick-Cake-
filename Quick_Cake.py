@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Quick Cake",
     "author": "Quick Cake",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Quick Cake",
     "description": "Автоматизация запекания текстур с High Poly на Low Poly",
@@ -38,7 +38,6 @@ class QuickCakeProps(PropertyGroup):
             ('BASE_COLOR',         "Base Color",        "Диффузный цвет (Diffuse, Color only)"),
             ('NORMAL',             "Normal",            "Карта нормалей (Tangent Space)"),
             ('AMBIENT_OCCLUSION',  "Ambient Occlusion", "Карта AO"),
-            ('UV',                 "UV",                "UV Layout"),
         ],
         default='BASE_COLOR',
         update=lambda self, ctx: _update_texture_name_and_cancel(self, ctx)
@@ -119,7 +118,6 @@ def _refresh_texture_name(props):
         'BASE_COLOR':        "_BaseColor",
         'NORMAL':            "_Normal",
         'AMBIENT_OCCLUSION': "_AO",
-        'UV':                "_UV",
     }
     base = props.low_poly.name if props.low_poly else ""
     suffix = suffix_map.get(props.bake_type, "")
@@ -302,7 +300,7 @@ def _exit_local_view(context):
 
 
 def _calculate_ao_distance(obj):
-    """Calculate AO Distance as 2-5% of object bounding box."""
+    """Calculate AO Distance as 3% of object bounding box."""
     bbox_coords = [obj.matrix_world @ obj.bound_box[i] for i in range(8)]
     min_x = min(c.x for c in bbox_coords)
     max_x = max(c.x for c in bbox_coords)
@@ -448,7 +446,7 @@ class QUICKCAKE_OT_auto_uv(Operator):
 class QUICKCAKE_OT_bake(Operator):
     bl_idname = "quickcake.bake"
     bl_label = "Запечь"
-    bl_description = "Запечь текстуру с High Poly на Low Poly (Selected to Active)"
+    bl_description = "Запечь текстуру с High Poly на Low Poly"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -476,7 +474,7 @@ class QUICKCAKE_OT_bake(Operator):
         # ── Image ─────────────────────────────────────────────────────────────────────
         image = get_or_create_image(tex_name, size)
         
-        # Правильная установка colorspace ПЕРЕД запеканием
+        # Установка colorspace ПЕРЕД запеканием
         if btype == 'NORMAL':
             image.colorspace_settings.name = 'Non-Color'
         elif btype == 'AMBIENT_OCCLUSION':
@@ -489,11 +487,6 @@ class QUICKCAKE_OT_bake(Operator):
         # ── Engine ────────────────────────────────────────────────────────────────────
         prev_engine = scene.render.engine
         scene.render.engine = 'CYCLES'
-        
-        # ── Bake Settings ─────────────────────────────────────────────────────────────
-        cycles = scene.cycles
-        prev_samples = cycles.samples
-        cycles.samples = 128
 
         # ── Visibility ────────────────────────────────────────────────────────────────
         high_vis       = ensure_visible(high)
@@ -501,21 +494,18 @@ class QUICKCAKE_OT_bake(Operator):
         high_col_states = _ensure_collection_visible(context, high)
         low_col_states  = _ensure_collection_visible(context, low)
 
-        # ── High Poly needs a valid surface shader for ALL bake types ────────────────
+        # ── Ensure materials ───────────────────────────────────────────────────────────
         _ensure_default_material(high)
+        _ensure_default_material(low)
 
-        # ── Bake target: image node in every Low Poly material ─────────────────────
-        if len(low.material_slots) == 0:
-            mat = bpy.data.materials.new(name=low.name + "_BakeMat")
-            mat.use_nodes = True
-            low.data.materials.append(mat)
+        # ── Setup bake target ──────────────────────────────────────────────────────────
         ensure_image_node(low, image)
 
-        # ── Object mode ──────────────────────────────────────────────────────────────
+        # ── Object mode ────────────────────────────────────────────────────────────────
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # ── Selection: High selected, Low active ─────────────────────────────────────
+        # ── Setup selection: High SELECTED, Low ACTIVE (Selected to Active) ──────────
         prev_active = context.view_layer.objects.active
         prev_sel    = list(context.selected_objects)
 
@@ -526,31 +516,31 @@ class QUICKCAKE_OT_bake(Operator):
 
         # ── Bake ─────────────────────────────────────────────────────────────────────
         bake_error = None
-        common = dict(
-            use_selected_to_active=True,
-            cage_extrusion=extrusion,
-            max_ray_distance=max_ray_distance,
-            margin=16,
-        )
 
         try:
             if btype == 'BASE_COLOR':
-                # Диффузный цвет без освещения
+                # Diffuse Color bake
                 bpy.ops.object.bake(
                     type='DIFFUSE',
-                    **common,
+                    use_selected_to_active=True,
+                    cage_extrusion=extrusion,
+                    max_ray_distance=max_ray_distance,
+                    margin=16,
                 )
 
             elif btype == 'NORMAL':
-                # Карта нормалей в Tangent Space
+                # Normal bake - Tangent Space
                 bpy.ops.object.bake(
                     type='NORMAL',
                     normal_space='TANGENT',
-                    **common,
+                    use_selected_to_active=True,
+                    cage_extrusion=extrusion,
+                    max_ray_distance=max_ray_distance,
+                    margin=16,
                 )
 
             elif btype == 'AMBIENT_OCCLUSION':
-                # AO с автоматическим расчетом расстояния
+                # AO bake с автоматическим расчетом
                 ao_distance = _calculate_ao_distance(low)
                 bpy.ops.object.bake(
                     type='AO',
@@ -558,12 +548,6 @@ class QUICKCAKE_OT_bake(Operator):
                     cage_extrusion=extrusion,
                     max_ray_distance=ao_distance,
                     margin=16,
-                )
-            
-            elif btype == 'UV':
-                bpy.ops.object.bake(
-                    type='UV',
-                    **common,
                 )
 
         except Exception as e:
@@ -574,7 +558,7 @@ class QUICKCAKE_OT_bake(Operator):
         _restore_collection_visible(context, high, high_col_states)
         _restore_collection_visible(context, low,  low_col_states)
         self._restore(context, scene, prev_engine, high, low,
-                      high_vis, low_vis, prev_active, prev_sel, prev_samples)
+                      high_vis, low_vis, prev_active, prev_sel)
 
         if bake_error:
             self.report({'ERROR'}, f"Ошибка запекания: {bake_error}")
@@ -590,11 +574,10 @@ class QUICKCAKE_OT_bake(Operator):
         self.report({'INFO'}, f"Запекание завершено: {tex_name}")
         return {'FINISHED'}
 
-    def _restore(self, context, scene, prev_engine, high, low, high_vis, low_vis, prev_active, prev_sel, prev_samples):
+    def _restore(self, context, scene, prev_engine, high, low, high_vis, low_vis, prev_active, prev_sel):
         restore_visibility(high, high_vis)
         restore_visibility(low, low_vis)
         scene.render.engine = prev_engine
-        scene.cycles.samples = prev_samples
         bpy.ops.object.select_all(action='DESELECT')
         for o in prev_sel:
             try:
@@ -682,9 +665,6 @@ class QUICKCAKE_OT_show_result(Operator):
             nt.links.new(normal_map.outputs[0], pbsdf.inputs['Normal'])
 
         elif btype == 'AMBIENT_OCCLUSION':
-            nt.links.new(img_node.outputs[0], pbsdf.inputs['Base Color'])
-
-        elif btype == 'UV':
             nt.links.new(img_node.outputs[0], pbsdf.inputs['Base Color'])
 
         low.data.materials.append(mat)

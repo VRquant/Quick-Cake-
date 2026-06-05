@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Quick Cake",
     "author": "Quick Cake",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Quick Cake",
     "description": "Автоматизация запекания текстур с High Poly на Low Poly",
@@ -36,7 +36,7 @@ class QuickCakeProps(PropertyGroup):
         name="Bake Type",
         items=[
             ('BASE_COLOR',         "Base Color",        "Диффузный цвет (Diffuse, Color only)"),
-            ('NORMAL',             "Normal",            "Карта нормалей (Object Space)"),
+            ('NORMAL',             "Normal",            "Карта нормалей (Tangent Space)"),
             ('AMBIENT_OCCLUSION',  "Ambient Occlusion", "Карта AO"),
             ('UV',                 "UV",                "UV Layout"),
         ],
@@ -128,7 +128,7 @@ def _refresh_texture_name(props):
 
 # ─────────────────────────────────────────────
 #  Helpers
-# ────────────────────────��────────────────────
+# ─────────────────────────────────────────────
 
 def count_tris(obj):
     """Return triangle count of obj (evaluating current state)."""
@@ -213,12 +213,10 @@ def deserialize_materials(obj, json_str):
     if not json_str:
         return
     data = json.loads(json_str)
-    # Remove all slots
     obj.select_set(True)
     bpy.context.view_layer.objects.active = obj
     while len(obj.material_slots) > 0:
         bpy.ops.object.material_slot_remove()
-    # Re-add
     for mat_name in data:
         obj.data.materials.append(None)
         idx = len(obj.material_slots) - 1
@@ -232,13 +230,11 @@ def _ensure_default_material(obj):
         mat = obj.material_slots[0].material
         mat.use_nodes = True
         nt = mat.node_tree
-        # Check if there's already an output-connected shader
         for n in nt.nodes:
             if n.type == 'OUTPUT_MATERIAL':
                 for link in nt.links:
                     if link.to_node == n and link.to_socket.name == 'Surface':
                         return
-        # No surface connected — add Principled
         pbsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
         out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
         if out is None:
@@ -246,7 +242,6 @@ def _ensure_default_material(obj):
         nt.links.new(pbsdf.outputs[0], out.inputs['Surface'])
         return
 
-    # No material at all — create one
     mat = bpy.data.materials.new(name=obj.name + "_QC_Default")
     mat.use_nodes = True
     nt = mat.node_tree
@@ -304,6 +299,29 @@ def _exit_local_view(context):
                             bpy.ops.view3d.localview()
                     break
             break
+
+
+def _calculate_ao_distance(obj):
+    """Calculate AO Distance as 2-5% of object bounding box."""
+    bbox_coords = [obj.matrix_world @ obj.bound_box[i] for i in range(8)]
+    min_x = min(c.x for c in bbox_coords)
+    max_x = max(c.x for c in bbox_coords)
+    min_y = min(c.y for c in bbox_coords)
+    max_y = max(c.y for c in bbox_coords)
+    min_z = min(c.z for c in bbox_coords)
+    max_z = max(c.z for c in bbox_coords)
+    
+    size_x = max_x - min_x
+    size_y = max_y - min_y
+    size_z = max_z - min_z
+    max_size = max(size_x, size_y, size_z)
+    
+    if max_size == 0:
+        return 0.1
+    
+    # 3% от максимального размера
+    ao_distance = max_size * 0.03
+    return max(ao_distance, 0.01)
 
 
 # ─────────────────────────────────────────────
@@ -471,8 +489,13 @@ class QUICKCAKE_OT_bake(Operator):
         # ── Engine ────────────────────────────────────────────────────────────────────
         prev_engine = scene.render.engine
         scene.render.engine = 'CYCLES'
+        
+        # ── Bake Settings ─────────────────────────────────────────────────────────────
+        cycles = scene.cycles
+        prev_samples = cycles.samples
+        cycles.samples = 128
 
-        # ── Visibility ─────────��─────────────────────────────────────────────────────
+        # ── Visibility ────────────────────────────────────────────────────────────────
         high_vis       = ensure_visible(high)
         low_vis        = ensure_visible(low)
         high_col_states = _ensure_collection_visible(context, high)
@@ -512,25 +535,29 @@ class QUICKCAKE_OT_bake(Operator):
 
         try:
             if btype == 'BASE_COLOR':
+                # Диффузный цвет без освещения
                 bpy.ops.object.bake(
                     type='DIFFUSE',
-                    use_pass_direct=False,
-                    use_pass_indirect=False,
-                    use_pass_color=True,
                     **common,
                 )
 
             elif btype == 'NORMAL':
+                # Карта нормалей в Tangent Space
                 bpy.ops.object.bake(
                     type='NORMAL',
-                    normal_space='OBJECT',
+                    normal_space='TANGENT',
                     **common,
                 )
 
             elif btype == 'AMBIENT_OCCLUSION':
+                # AO с автоматическим расчетом расстояния
+                ao_distance = _calculate_ao_distance(low)
                 bpy.ops.object.bake(
                     type='AO',
-                    **common,
+                    use_selected_to_active=True,
+                    cage_extrusion=extrusion,
+                    max_ray_distance=ao_distance,
+                    margin=16,
                 )
             
             elif btype == 'UV':
@@ -547,7 +574,7 @@ class QUICKCAKE_OT_bake(Operator):
         _restore_collection_visible(context, high, high_col_states)
         _restore_collection_visible(context, low,  low_col_states)
         self._restore(context, scene, prev_engine, high, low,
-                      high_vis, low_vis, prev_active, prev_sel)
+                      high_vis, low_vis, prev_active, prev_sel, prev_samples)
 
         if bake_error:
             self.report({'ERROR'}, f"Ошибка запекания: {bake_error}")
@@ -563,10 +590,11 @@ class QUICKCAKE_OT_bake(Operator):
         self.report({'INFO'}, f"Запекание завершено: {tex_name}")
         return {'FINISHED'}
 
-    def _restore(self, context, scene, prev_engine, high, low, high_vis, low_vis, prev_active, prev_sel):
+    def _restore(self, context, scene, prev_engine, high, low, high_vis, low_vis, prev_active, prev_sel, prev_samples):
         restore_visibility(high, high_vis)
         restore_visibility(low, low_vis)
         scene.render.engine = prev_engine
+        scene.cycles.samples = prev_samples
         bpy.ops.object.select_all(action='DESELECT')
         for o in prev_sel:
             try:
@@ -622,7 +650,6 @@ class QUICKCAKE_OT_show_result(Operator):
         mat_name = low.name + "_QC_Preview"
         if mat_name in bpy.data.materials:
             mat = bpy.data.materials[mat_name]
-            # Clear its nodes
             nt = mat.node_tree
             for n in list(nt.nodes):
                 nt.nodes.remove(n)
@@ -649,7 +676,7 @@ class QUICKCAKE_OT_show_result(Operator):
 
         elif btype == 'NORMAL':
             normal_map = nt.nodes.new('ShaderNodeNormalMap')
-            normal_map.space = 'OBJECT'
+            normal_map.space = 'TANGENT'
             normal_map.location = (-100, -150)
             nt.links.new(img_node.outputs[0], normal_map.inputs['Color'])
             nt.links.new(normal_map.outputs[0], pbsdf.inputs['Normal'])
@@ -684,25 +711,20 @@ class QUICKCAKE_OT_cancel_result(Operator):
             self.report({'ERROR'}, "Low Poly не задана")
             return {'CANCELLED'}
 
-        # Exit local view if active
         _exit_local_view(context)
 
-        # Select low for ops
         vis = ensure_visible(low)
         bpy.ops.object.select_all(action='DESELECT')
         low.select_set(True)
         context.view_layer.objects.active = low
 
-        # Remove created preview material
         mat_name = low.name + "_QC_Preview"
         if mat_name in bpy.data.materials:
             preview_mat = bpy.data.materials[mat_name]
-            # Remove from object
             while len(low.material_slots) > 0:
                 bpy.ops.object.material_slot_remove()
             bpy.data.materials.remove(preview_mat)
 
-        # Restore original materials
         deserialize_materials(low, props.saved_materials_json)
         restore_visibility(low, vis)
 
@@ -840,7 +862,6 @@ class QUICKCAKE_PT_main(Panel):
             row2.label(text="Low Poly:")
             row2.operator("quickcake.pick_low_poly", text="", icon='EYEDROPPER')
 
-        # Triangle warning
         if tri_warning:
             warn_box = box2.box()
             warn_box.alert = True
@@ -850,7 +871,6 @@ class QUICKCAKE_PT_main(Panel):
             warn_row.operator("quickcake.confirm_low_poly", text="Продолжить", icon='CHECKMARK')
             warn_row.operator("quickcake.cancel_low_poly", text="Отмена", icon='X')
 
-        # Auto UV button
         if props.low_poly:
             uv_row = box2.row()
             uv_row.operator("quickcake.auto_uv", text="Auto UV", icon='UV')
@@ -915,8 +935,8 @@ class QUICKCAKE_PT_main(Panel):
 
         layout.separator()
 
-        # ─── Step 8: Show Result ───
-        step8_active = props.bake_done and not props.show_result_used
+        # ─── Step 8: Cancel Result ───
+        step8_active = props.show_result_used and not props.cancel_used
         row8 = layout.row(align=True)
         row8.enabled = step8_active
         lbl8 = row8.row()
@@ -924,35 +944,22 @@ class QUICKCAKE_PT_main(Panel):
         lbl8.label(text="8.")
         op8 = row8.row()
         op8.scale_x = 10.0
-        op8.operator("quickcake.show_result", text="Показать результат", icon='HIDE_OFF')
+        op8.operator("quickcake.cancel_result", text="Вернуться", icon='LOOP_BACK')
 
         layout.separator()
 
-        # ─── Step 9: Cancel ───
-        step9_active = props.show_result_used and not props.cancel_used
+        # ─── Step 9: Save + Trash ───
+        step9_active = props.bake_done
         row9 = layout.row(align=True)
-        row9.enabled = step9_active
         lbl9 = row9.row()
         lbl9.ui_units_x = 1.5
+        lbl9.enabled = step9_active
         lbl9.label(text="9.")
         op9 = row9.row()
+        op9.enabled = step9_active
         op9.scale_x = 10.0
-        op9.operator("quickcake.cancel_result", text="Вернуться", icon='LOOP_BACK')
-
-        layout.separator()
-
-        # ─── Step 10: Save ───
-        step10_active = props.bake_done
-        row10 = layout.row(align=True)
-        lbl10 = row10.row()
-        lbl10.ui_units_x = 1.5
-        lbl10.enabled = step10_active
-        lbl10.label(text="10.")
-        op10 = row10.row()
-        op10.enabled = step10_active
-        op10.scale_x = 10.0
-        op10.operator("quickcake.save_texture", text="Сохранить", icon='FILE_TICK')
-        trash = row10.row()
+        op9.operator("quickcake.save_texture", text="Сохранить", icon='FILE_TICK')
+        trash = row9.row()
         trash.active = True
         trash.enabled = True
         trash.operator("quickcake.clear_all", text="", icon='TRASH')

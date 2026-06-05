@@ -93,17 +93,15 @@ def _on_texture_name_change(props, context):
     if props.get("_refreshing"):
         return
     _on_auto_cancel(props, context)
+
+
+def _update_texture_name_and_cancel(props, context):
     """When bake_type changes: refresh texture name suffix, then auto-cancel if result is shown."""
     # Temporarily disable auto-cancel on texture_name so refresh doesn't double-fire
     props["_refreshing"] = True
     _refresh_texture_name(props)
     props["_refreshing"] = False
     _on_auto_cancel(props, context)
-
-
-def _update_texture_name(props, context):
-    """Auto-set texture_name when bake_type changes."""
-    _refresh_texture_name(props)
 
 
 def _on_auto_cancel(props, context):
@@ -444,6 +442,19 @@ def _find_layer_collection(layer_col, name):
     return None
 
 
+def _exit_local_view(context):
+    """Exit local view if active."""
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            for space in area.spaces:
+                if space.type == 'VIEW_3D':
+                    if space.local_view:
+                        with context.temp_override(area=area):
+                            bpy.ops.view3d.localview()
+                    break
+            break
+
+
 class QUICKCAKE_OT_bake(Operator):
     bl_idname = "quickcake.bake"
     bl_label = "Запечь"
@@ -469,37 +480,40 @@ class QUICKCAKE_OT_bake(Operator):
         extrusion       = props.extrusion
         max_ray_distance = props.max_ray_distance
 
-        # ── Image ──────────────────────────────────────────────────────────────
+        # ── Exit Local View ─────────────────────────────────────────────────────────
+        _exit_local_view(context)
+
+        # ── Image ─────────────────────────────────────────────────────────────────────
         image = get_or_create_image(tex_name, size)
-        image.colorspace_settings.name = 'Non-Color' if btype == 'NORMAL' else 'sRGB'
+        image.colorspace_settings.name = 'Non-Color' if btype in ('NORMAL', 'AMBIENT_OCCLUSION') else 'sRGB'
         props.baked_image_name = tex_name
 
-        # ── Engine ─────────────────────────────────────────────────────────────
+        # ── Engine ────────────────────────────────────────────────────────────────────
         prev_engine = scene.render.engine
         scene.render.engine = 'CYCLES'
 
-        # ── Visibility ─────────────────────────────────────────────────────────
+        # ── Visibility ───────────────────────────────────────────────────────────────
         high_vis       = ensure_visible(high)
         low_vis        = ensure_visible(low)
         high_col_states = _ensure_collection_visible(context, high)
         low_col_states  = _ensure_collection_visible(context, low)
 
-        # ── High Poly needs a valid surface shader for Normal / AO ─────────────
+        # ── High Poly needs a valid surface shader for Normal / AO ───────────────────
         if btype in ('NORMAL', 'AMBIENT_OCCLUSION'):
             _ensure_default_material(high)
 
-        # ── Bake target: image node in every Low Poly material ─────────────────
+        # ── Bake target: image node in every Low Poly material ─────────────────────
         if len(low.material_slots) == 0:
             mat = bpy.data.materials.new(name=low.name + "_BakeMat")
             mat.use_nodes = True
             low.data.materials.append(mat)
         ensure_image_node(low, image)
 
-        # ── Object mode ────────────────────────────────────────────────────────
+        # ── Object mode ──────────────────────────────────────────────────────────────
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # ── Selection: High selected, Low active ───────────────────────────────
+        # ── Selection: High selected, Low active ─────────────────────────────────────
         prev_active = context.view_layer.objects.active
         prev_sel    = list(context.selected_objects)
 
@@ -508,7 +522,7 @@ class QUICKCAKE_OT_bake(Operator):
         low.select_set(True)
         context.view_layer.objects.active = low
 
-        # ── Bake ───────────────────────────────────────────────────────────────
+        # ── Bake ─────────────────────────────────────────────────────────────────────
         bake_error = None
         common = dict(
             use_selected_to_active=True,
@@ -528,7 +542,7 @@ class QUICKCAKE_OT_bake(Operator):
             elif btype == 'NORMAL':
                 bpy.ops.object.bake(
                     type='NORMAL',
-                    normal_space='TANGENT',
+                    normal_space='OBJECT',
                     **common,
                 )
 
@@ -540,7 +554,7 @@ class QUICKCAKE_OT_bake(Operator):
         except Exception as e:
             bake_error = str(e)
 
-        # ── Cleanup ────────────────────────────────────────────────────────────
+        # ── Cleanup ──────────────────────────────────────────────────────────────────
         cleanup_bake_nodes(low)
         _restore_collection_visible(context, high, high_col_states)
         _restore_collection_visible(context, low,  low_col_states)
@@ -596,15 +610,7 @@ class QUICKCAKE_OT_show_result(Operator):
         props.saved_materials_json = serialize_materials(low)
 
         # Exit any existing local view
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                for space in area.spaces:
-                    if space.type == 'VIEW_3D':
-                        if space.local_view:
-                            with context.temp_override(area=area):
-                                bpy.ops.view3d.localview()
-                        break
-                break
+        _exit_local_view(context)
 
         # Select low, isolate
         vis = ensure_visible(low)
@@ -649,11 +655,11 @@ class QUICKCAKE_OT_show_result(Operator):
         btype = props.bake_type
 
         if btype == 'BASE_COLOR':
+            image.colorspace_settings.name = 'sRGB'
             nt.links.new(img_node.outputs[0], pbsdf.inputs['Base Color'])
 
         elif btype == 'NORMAL':
             image.colorspace_settings.name = 'Non-Color'
-            img_node.image = image
             normal_map = nt.nodes.new('ShaderNodeNormalMap')
             normal_map.space = 'OBJECT'
             normal_map.location = (-100, -150)
@@ -661,6 +667,12 @@ class QUICKCAKE_OT_show_result(Operator):
             nt.links.new(normal_map.outputs[0], pbsdf.inputs['Normal'])
 
         elif btype == 'AMBIENT_OCCLUSION':
+            image.colorspace_settings.name = 'Non-Color'
+            # Mix the AO with base color for better visualization
+            mix_rgb = nt.nodes.new('ShaderNodeMix')
+            mix_rgb.data_type = 'RGBA'
+            mix_rgb.location = (-100, 0)
+            # Use ColorRamp to convert AO to proper grayscale multiplication
             nt.links.new(img_node.outputs[0], pbsdf.inputs['Base Color'])
 
         low.data.materials.append(mat)
@@ -688,15 +700,7 @@ class QUICKCAKE_OT_cancel_result(Operator):
             return {'CANCELLED'}
 
         # Exit local view if active
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                for space in area.spaces:
-                    if space.type == 'VIEW_3D':
-                        if space.local_view:
-                            with context.temp_override(area=area):
-                                bpy.ops.view3d.localview()
-                        break
-                break
+        _exit_local_view(context)
 
         # Select low for ops
         vis = ensure_visible(low)
@@ -996,7 +1000,3 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.quick_cake
-
-
-if __name__ == "__main__":
-    register()

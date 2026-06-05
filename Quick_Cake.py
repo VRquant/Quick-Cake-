@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Quick Cake",
     "author": "Quick Cake",
-    "version": (1, 3, 1),
+    "version": (1, 4, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Quick Cake",
     "description": "Автоматизация запекания текстур с High Poly на Low Poly",
@@ -32,23 +32,8 @@ class QuickCakeProps(PropertyGroup):
         name="Low Poly",
         type=bpy.types.Object
     )
-    bake_type: EnumProperty(
-        name="Bake Type",
-        items=[
-            ('BASE_COLOR',         "Base Color",        "Диффузный цвет (Color only)"),
-            ('NORMAL',             "Normal",            "Карта нормалей (Tangent Space)"),
-            ('AMBIENT_OCCLUSION',  "Ambient Occlusion", "Карта AO"),
-        ],
-        default='BASE_COLOR',
-        update=lambda self, ctx: _update_texture_name_and_cancel(self, ctx)
-    )
-    texture_name: StringProperty(
-        name="Имя текстуры",
-        default="",
-        update=lambda self, ctx: _on_texture_name_change(self, ctx)
-    )
     texture_size: EnumProperty(
-        name="Размер текстуры",
+        name="Размер Base Color",
         items=[
             ('32',   "32x32",     ""),
             ('64',   "64x64",     ""),
@@ -61,6 +46,21 @@ class QuickCakeProps(PropertyGroup):
         ],
         default='1024',
         update=lambda self, ctx: _on_texture_size_change(self, ctx)
+    )
+    bake_type: EnumProperty(
+        name="Bake Type",
+        items=[
+            ('BASE_COLOR',         "Base Color",        "Диффузный цвет (Diffuse, Color only)"),
+            ('NORMAL',             "Normal",            "Карта нормалей (Object Space)"),
+            ('AMBIENT_OCCLUSION',  "Ambient Occlusion", "Карта AO"),
+        ],
+        default='BASE_COLOR',
+        update=lambda self, ctx: _update_texture_name_and_cancel(self, ctx)
+    )
+    texture_name: StringProperty(
+        name="Имя текстуры",
+        default="",
+        update=lambda self, ctx: _on_texture_name_change(self, ctx)
     )
     show_projection: BoolProperty(
         name="Отступы проецирования",
@@ -82,12 +82,14 @@ class QuickCakeProps(PropertyGroup):
     bake_done: BoolProperty(default=False)
     show_result_used: BoolProperty(default=False)
     cancel_used: BoolProperty(default=False)
+    # for undo of Show Result
     saved_materials_json: StringProperty(default="")
+    was_in_local_view: BoolProperty(default=False)
     baked_image_name: StringProperty(default="")
 
 
 def _on_texture_name_change(props, context):
-    """Auto-cancel when user manually edits texture name."""
+    """Auto-cancel when user manually edits texture name. Skip during programmatic refresh."""
     if props.get("_refreshing"):
         return
     _on_auto_cancel(props, context)
@@ -95,6 +97,7 @@ def _on_texture_name_change(props, context):
 
 def _update_texture_name_and_cancel(props, context):
     """When bake_type changes: refresh texture name suffix, then auto-cancel if result is shown."""
+    # Temporarily disable auto-cancel on texture_name so refresh doesn't double-fire
     props["_refreshing"] = True
     _refresh_texture_name(props)
     props["_refreshing"] = False
@@ -220,70 +223,6 @@ def deserialize_materials(obj, json_str):
         idx = len(obj.material_slots) - 1
         if mat_name and mat_name in bpy.data.materials:
             obj.material_slots[idx].material = bpy.data.materials[mat_name]
-
-
-def _ensure_default_material(obj):
-    """Ensure obj has at least one material with a Principled BSDF."""
-    if len(obj.material_slots) > 0 and obj.material_slots[0].material is not None:
-        mat = obj.material_slots[0].material
-        mat.use_nodes = True
-        nt = mat.node_tree
-        for n in nt.nodes:
-            if n.type == 'OUTPUT_MATERIAL':
-                for link in nt.links:
-                    if link.to_node == n and link.to_socket.name == 'Surface':
-                        return
-        pbsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
-        out = next((n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL'), None)
-        if out is None:
-            out = nt.nodes.new('ShaderNodeOutputMaterial')
-        nt.links.new(pbsdf.outputs[0], out.inputs['Surface'])
-        return
-
-    mat = bpy.data.materials.new(name=obj.name + "_QC_Default")
-    mat.use_nodes = True
-    nt = mat.node_tree
-    for n in list(nt.nodes):
-        nt.nodes.remove(n)
-    pbsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
-    out = nt.nodes.new('ShaderNodeOutputMaterial')
-    nt.links.new(pbsdf.outputs[0], out.inputs['Surface'])
-    obj.data.materials.append(mat)
-
-
-def _ensure_collection_visible(context, obj):
-    """Make all collections containing obj visible in view layer. Returns state dict."""
-    states = {}
-    for col in obj.users_collection:
-        vl_col = context.view_layer.layer_collection
-        found = _find_layer_collection(vl_col, col.name)
-        if found:
-            states[col.name] = {
-                "hide": found.hide_viewport,
-                "exclude": found.exclude,
-            }
-            found.hide_viewport = False
-            found.exclude = False
-    return states
-
-
-def _restore_collection_visible(context, obj, states):
-    for col in obj.users_collection:
-        vl_col = context.view_layer.layer_collection
-        found = _find_layer_collection(vl_col, col.name)
-        if found and col.name in states:
-            found.hide_viewport = states[col.name]["hide"]
-            found.exclude = states[col.name]["exclude"]
-
-
-def _find_layer_collection(layer_col, name):
-    if layer_col.name == name:
-        return layer_col
-    for child in layer_col.children:
-        result = _find_layer_collection(child, name)
-        if result:
-            return result
-    return None
 
 
 def _exit_local_view(context):
@@ -431,7 +370,7 @@ class QUICKCAKE_OT_bake(Operator):
         scene = context.scene
 
         high = props.high_poly
-        low  = props.low_poly
+        low = props.low_poly
         if high is None or low is None:
             self.report({'ERROR'}, "Выберите High Poly и Low Poly")
             return {'CANCELLED'}
@@ -439,86 +378,82 @@ class QUICKCAKE_OT_bake(Operator):
             self.report({'ERROR'}, "Укажите имя текстуры")
             return {'CANCELLED'}
 
-        size     = int(props.texture_size)
+        size = int(props.texture_size)
         tex_name = props.texture_name.strip()
-        btype    = props.bake_type
-        extrusion       = props.extrusion
+        btype = props.bake_type
+        extrusion = props.extrusion
         max_ray_distance = props.max_ray_distance
 
-        # ── Exit Local View ─────────────────────────────────────────────────────────
+        # Exit local view
         _exit_local_view(context)
 
-        # ── Image ─────────────────────────────────────────────────────────────────────
+        # Create/get image
         image = get_or_create_image(tex_name, size)
         
-        # Установка colorspace ПЕРЕД запеканием
-        if btype == 'NORMAL':
-            image.colorspace_settings.name = 'Non-Color'
-        elif btype == 'AMBIENT_OCCLUSION':
+        # Set colorspace
+        if btype in ('NORMAL', 'AMBIENT_OCCLUSION'):
             image.colorspace_settings.name = 'Non-Color'
         else:
             image.colorspace_settings.name = 'sRGB'
-        
+
         props.baked_image_name = tex_name
 
-        # ── Engine ────────────────────────────────────────────────────────────────────
+        # Save engine
         prev_engine = scene.render.engine
         scene.render.engine = 'CYCLES'
 
-        # ── Visibility ────────────────────────────────────────────────────────────────
-        high_vis       = ensure_visible(high)
-        low_vis        = ensure_visible(low)
-        high_col_states = _ensure_collection_visible(context, high)
-        low_col_states  = _ensure_collection_visible(context, low)
+        # Visibility
+        high_vis = ensure_visible(high)
+        low_vis = ensure_visible(low)
 
-        # ── Ensure materials ───────────────────────────────────────────────────────────
-        _ensure_default_material(high)
-        _ensure_default_material(low)
+        # Ensure materials
+        for mat_slot in low.material_slots:
+            if mat_slot.material is None:
+                new_mat = bpy.data.materials.new(name=low.name + "_Bake")
+                new_mat.use_nodes = True
+                low.data.materials.append(new_mat)
+                break
 
-        # ── Setup bake target ──────────────────────────────────────────────────────────
+        # Ensure Low Poly has an image node
         ensure_image_node(low, image)
 
-        # ── Object mode ────────────────────────────────────────────────────────────────
+        # Object mode
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # ── Setup selection: High SELECTED, Low ACTIVE (Selected to Active) ──────────
+        # Selection: High selected + Low active (Selected to Active)
         prev_active = context.view_layer.objects.active
-        prev_sel    = list(context.selected_objects)
+        prev_sel = list(context.selected_objects)
 
         bpy.ops.object.select_all(action='DESELECT')
         high.select_set(True)
         low.select_set(True)
         context.view_layer.objects.active = low
 
-        # ── Bake ─────────────────────────────────────────────────────────────────────
+        # Perform bake with proper operator settings
         bake_error = None
-
         try:
             if btype == 'BASE_COLOR':
-                # Diffuse Color bake - только цвет без освещения
                 bpy.ops.object.bake(
                     type='DIFFUSE',
                     use_selected_to_active=True,
                     cage_extrusion=extrusion,
                     max_ray_distance=max_ray_distance,
                     margin=16,
-                    pass_filter={'COLOR'},
+                    use_pass_direct=False,
+                    use_pass_indirect=False,
+                    use_pass_color=True,
                 )
-
             elif btype == 'NORMAL':
-                # Normal bake - Tangent Space
                 bpy.ops.object.bake(
                     type='NORMAL',
-                    normal_space='TANGENT',
                     use_selected_to_active=True,
                     cage_extrusion=extrusion,
                     max_ray_distance=max_ray_distance,
                     margin=16,
+                    normal_space='OBJECT',
                 )
-
             elif btype == 'AMBIENT_OCCLUSION':
-                # AO bake
                 bpy.ops.object.bake(
                     type='AO',
                     use_selected_to_active=True,
@@ -526,35 +461,17 @@ class QUICKCAKE_OT_bake(Operator):
                     max_ray_distance=max_ray_distance,
                     margin=16,
                 )
-
         except Exception as e:
             bake_error = str(e)
 
-        # ── Cleanup ──────────────────────────────────────────────────────────────────
+        # Cleanup
         cleanup_bake_nodes(low)
-        _restore_collection_visible(context, high, high_col_states)
-        _restore_collection_visible(context, low,  low_col_states)
-        self._restore(context, scene, prev_engine, high, low,
-                      high_vis, low_vis, prev_active, prev_sel)
 
-        if bake_error:
-            self.report({'ERROR'}, f"Ошибка запекания: {bake_error}")
-            return {'CANCELLED'}
-
-        props.bake_done       = True
-        props.show_result_used = False
-        props.cancel_used      = False
-
-        # Auto-show result
-        bpy.ops.quickcake.show_result()
-
-        self.report({'INFO'}, f"Запекание завершено: {tex_name}")
-        return {'FINISHED'}
-
-    def _restore(self, context, scene, prev_engine, high, low, high_vis, low_vis, prev_active, prev_sel):
+        # Restore
         restore_visibility(high, high_vis)
         restore_visibility(low, low_vis)
         scene.render.engine = prev_engine
+
         bpy.ops.object.select_all(action='DESELECT')
         for o in prev_sel:
             try:
@@ -563,10 +480,24 @@ class QUICKCAKE_OT_bake(Operator):
                 pass
         context.view_layer.objects.active = prev_active
 
+        if bake_error:
+            self.report({'ERROR'}, f"Ошибка запекания: {bake_error}")
+            return {'CANCELLED'}
+
+        props.bake_done = True
+        props.show_result_used = False
+        props.cancel_used = False
+
+        # Auto show result
+        bpy.ops.quickcake.show_result()
+
+        self.report({'INFO'}, f"Запекание завершено: {tex_name}")
+        return {'FINISHED'}
+
 
 class QUICKCAKE_OT_show_result(Operator):
     bl_idname = "quickcake.show_result"
-    bl_label = "Показать результат"
+    bl_label = "Пока��ать результат"
     bl_description = "Показать результат запекания на Low Poly модели"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -610,17 +541,16 @@ class QUICKCAKE_OT_show_result(Operator):
         mat_name = low.name + "_QC_Preview"
         if mat_name in bpy.data.materials:
             mat = bpy.data.materials[mat_name]
-            # Удаляем все ноды, чтобы не было дублей
             nt = mat.node_tree
             for n in list(nt.nodes):
                 nt.nodes.remove(n)
         else:
             mat = bpy.data.materials.new(name=mat_name)
-        
+
         mat.use_nodes = True
         nt = mat.node_tree
 
-        # Создаем чистый граф нодов
+        # Create clean node setup
         out = nt.nodes.new('ShaderNodeOutputMaterial')
         pbsdf = nt.nodes.new('ShaderNodeBsdfPrincipled')
         out.location = (300, 0)
@@ -638,7 +568,7 @@ class QUICKCAKE_OT_show_result(Operator):
 
         elif btype == 'NORMAL':
             normal_map = nt.nodes.new('ShaderNodeNormalMap')
-            normal_map.space = 'TANGENT'
+            normal_map.space = 'OBJECT'
             normal_map.location = (-100, -150)
             nt.links.new(img_node.outputs[0], normal_map.inputs['Color'])
             nt.links.new(normal_map.outputs[0], pbsdf.inputs['Normal'])
@@ -775,7 +705,7 @@ class QUICKCAKE_OT_toggle_projection(Operator):
 
 # ─────────────────────────────────────────────
 #  Panel
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────���──
 
 class QUICKCAKE_PT_main(Panel):
     bl_label = "Quick Cake"
@@ -960,3 +890,7 @@ def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.quick_cake
+
+
+if __name__ == "__main__":
+    register()
